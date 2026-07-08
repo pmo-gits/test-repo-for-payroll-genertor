@@ -1,0 +1,947 @@
+/*******************************************************
+ * GENERATE PAYSLIPS  (v2 — template-copy based)
+ *
+ * Runs in the Locked Payroll spreadsheet, after
+ * "Generate Bank Transfer File".
+ *
+ * HOW THIS VERSION WORKS (different from v1):
+ * Instead of building the payslip sheet from scratch, this
+ * script makes a Drive copy of PMO's finalized template file
+ * (PSG.TEMPLATE_FILE_ID) each month. That template already has
+ * 3 tabs — Employees / Employees_Hindi / Staffs — each with ONE
+ * fully formatted sample block, including the real logo and
+ * signature images pasted in as "Image in cell". The script
+ * then:
+ *   1) Clones that one block down the tab (via copyTo, which
+ *      replicates images + formatting + merges in one call)
+ *      for every NEW eligible employee this run.
+ *   2) Overwrites only the data cells with real values, in two
+ *      passes per tab: a big "safe" column range with no images
+ *      in it (single call for all new employees at once), and a
+ *      narrower per-block range for the columns that share space
+ *      with the logo/signature images at different rows (one
+ *      call per new employee, since that range must avoid the
+ *      exact rows the images sit on).
+ * The script NEVER writes to the columns/rows the logo and
+ * signature images occupy, so they can never be clobbered.
+ *
+ * Eligibility: PAY_ROLL row's "Bank Transfer Mark Down" holds a
+ * real timestamp (not blank, not a SKIPPED value) — same rule as
+ * PAYROLL_GEN_7.
+ *
+ * Routing:
+ *   Category = STAFF        -> "Staffs" tab
+ *   Category = WORKER, and Employee Master "MIGRANT" column:
+ *     NON-MIGRANT -> "Employees" tab (English/Tamil)
+ *     MIGRANT     -> "Employees_Hindi" tab (English/Hindi)
+ *
+ * Re-run behaviour: APPEND ONLY, per tab. A hidden
+ * "_GENERATED_LOG" tab (Payroll Month, Employee Code, Tab Name)
+ * tracks who has already been placed in which tab this month, so
+ * a re-run only adds newly-eligible employees and never touches
+ * or duplicates an existing employee's block.
+ *
+ * USER GATE (same pattern as GEN_2 / GEN_6 / GEN_7):
+ * ✅ pmo@butlerleather.com      → runs directly
+ * ✅ hrassist@butlerleather.com → runs via Web App (as owner)
+ * ✅ Others                     → blocked
+ *
+ * IMPORTANT — ONE INPUT STILL NEEDED FROM PMO:
+ *   PSG.TEMPLATE_FILE_ID below is a placeholder. Replace it with
+ *   the Drive file ID of the finalized "Template Payslip" Google
+ *   Sheet (3 tabs, images already pasted in) before running.
+ *
+ * ONE-TIME MANUAL SETUP STILL NEEDED (unchanged from v1):
+ * 1) Add a menu item calling generatePayslips() to the
+ *    'Payroll-Admin' menu in PAYROLL_GEN_3.MENU.
+ * 2) Add ONE branch to the EXISTING doPost() in
+ *    PAYROLL_GEN_6.Generate_Locked_Payroll:
+ *      } else if (action === 'generatePayslips') {
+ *        result = generatePayslipsServer_(payload);
+ *******************************************************/
+
+const PSG_WEBAPP_URL     = 'https://script.google.com/macros/s/AKfycbyhAADy_VUoTuWt8QlLGR5B6I5ckJf67FM456CRxHspRmhluFEZikksIXGRB3pkECK5/exec';
+const PSG_OWNER_EMAIL    = 'pmo@butlerleather.com';
+const PSG_ALLOWED_EMAIL  = 'hrassist@butlerleather.com';
+
+const PSG = Object.freeze({
+  TEMPLATE_FILE_ID: '1IrcvPh6zASMqxOrBjAZkt_E5lQt_Slj8Lhvpkx9qyOQ', // Template Payslip file
+
+  FOLDER_ID: '1x2SxEqGO1NFNypcOnC6Rr2VlVz8BSe2S', // MONTHLY PAYSLIP folder
+
+  FILE_PREFIX: 'Payslip',
+
+  TABS: Object.freeze({
+    EMPLOYEES: 'Employees',
+    EMPLOYEES_HINDI: 'Employees_Hindi',
+    STAFFS: 'Staffs',
+    LOG: '_GENERATED_LOG',
+  }),
+
+  CATEGORY: Object.freeze({
+    WORKER: 'WORKER',
+    STAFF: 'STAFF',
+  }),
+
+  MIGRANT: Object.freeze({
+    MIGRANT: 'MIGRANT',
+    NON_MIGRANT: 'NON-MIGRANT',
+  }),
+
+  ACCESS: Object.freeze({
+    EDITORS: Object.freeze(['hrassist@butlerleather.com']),
+    VIEWERS: Object.freeze(['nazneen@butlerleather.com']),
+  }),
+
+  META_KEYS: Object.freeze({
+    PAYSLIP_FILE_ID: 'PAYSLIP_FILE_ID',
+    PAYSLIP_LAST_RUN: 'PAYSLIP_LAST_RUN',
+  }),
+
+  // ===== WORKER (Employees / Employees_Hindi) block layout =====
+  // Identical cell positions in both tabs — only the label text differs.
+  WORKER: Object.freeze({
+    BLOCK_ROWS: 29,          // content rows per block
+    STRIDE: 30,              // BLOCK_ROWS + 1 spacer row
+    BULK_COLS: [1, 8],       // columns A:H — safe, no images ever sit here
+    IMG_COLS: [9, 10],       // columns I:J — logo (rows1-2) + signature (rows27-28), NEVER written
+    PERBLOCK_COL: 10,        // column J — deduction values share this column with the images,
+    PERBLOCK_ROWS: [11, 21], // but only at rows 11-21, which never overlap the image rows
+  }),
+
+  // ===== STAFF (Staffs) block layout =====
+  STAFF: Object.freeze({
+    BLOCK_ROWS: 32,
+    STRIDE: 33,
+    BULK_COLS: [1, 7],       // columns A:G — safe, no images ever sit here (includes NET at G27)
+    IMG_COLS: [8, 9],        // columns H:I — logo (rows1-2) + signature (rows30-31)
+    PERBLOCK_COLS: [8, 9],   // columns H:I — deduction/leave/identity values share these columns
+    PERBLOCK_ROWS: [6, 27],  // with the images, but only at rows 6-27, never overlapping rows 1-2/30-31
+  }),
+});
+
+/* =========================================================
+   ENTRY POINT
+========================================================= */
+
+function generatePayslips() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    if (currentUser === PSG_OWNER_EMAIL.toLowerCase()) {
+      const result = generatePayslipsServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      ui.alert('Generate Payslips', result.message || 'No response received.', ui.ButtonSet.OK);
+      return;
+    }
+
+    if (currentUser === PSG_ALLOWED_EMAIL.toLowerCase()) {
+      if (!PSG_WEBAPP_URL || PSG_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert('Generate Payslips', 'Web App URL is not configured.', ui.ButtonSet.OK);
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(PSG_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'generatePayslips',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      ui.alert('Generate Payslips', result.message || 'No response received from Web App.', ui.ButtonSet.OK);
+      return;
+    }
+
+    ui.alert('Generate Payslips', 'You are not authorized to run this function.', ui.ButtonSet.OK);
+
+  } catch (err) {
+    ui.alert('Generate Payslips', `Error: ${err && err.message ? err.message : err}`, ui.ButtonSet.OK);
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION (runs as owner always)
+========================================================= */
+
+function generatePayslipsServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    return { success: false, message: 'Another payslip generation is already running. Please wait and try again.' };
+  }
+
+  // ── Rollback-safety tracking for this run ──
+  let createdNewPayslipFile = false;
+  let anyDataWrittenThisRun = false;
+  let payslipFileForCleanup = null;
+
+  try {
+    if (!PSG.TEMPLATE_FILE_ID || PSG.TEMPLATE_FILE_ID === 'PASTE_TEMPLATE_PAYSLIP_FILE_ID_HERE') {
+      return { success: false, message: 'PSG.TEMPLATE_FILE_ID is not configured. Paste the Template Payslip file ID before running.' };
+    }
+
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+
+    const payrollSh = ss.getSheetByName(CONST.TEMPLATES.PAYROLL_TAB_NAME);
+    if (!payrollSh) throw new Error(`Missing sheet: ${CONST.TEMPLATES.PAYROLL_TAB_NAME}`);
+
+    const metaSh = ss.getSheetByName(CONST.TABS.META_DATA);
+    if (!metaSh) throw new Error(`Missing sheet: ${CONST.TABS.META_DATA}`);
+
+    const lockStatus = String(psgGetMetaValue_(metaSh, 'LOCK_STATUS') || '').trim().toUpperCase();
+    if (lockStatus !== CONST.VALUES.LOCK_STATUS_LOCKED) {
+      return { success: false, message: 'Payroll is not LOCKED. Payslips can only be generated after LOCK_STATUS = LOCKED.' };
+    }
+
+    const monthLabel = String(psgGetMetaValue_(metaSh, 'PAYROLL_MONTH_LABEL') || '').trim();
+    if (!monthLabel) return { success: false, message: 'PAYROLL_MONTH_LABEL is missing in META_DATA.' };
+
+    // ---- Read PAY_ROLL once (bulk) ----
+    const lastRow = payrollSh.getLastRow();
+    const lastCol = payrollSh.getLastColumn();
+    if (lastRow < 2 || lastCol < 1) return { success: false, message: 'No payroll data found in PAY_ROLL.' };
+
+    const headers = payrollSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+    const idx = psgBuildHeaderIndex_(headers);
+
+    psgRequireHeader_(idx, 'Employee Code', 'PAY_ROLL');
+    psgRequireHeader_(idx, 'Category', 'PAY_ROLL');
+    psgRequireHeader_(idx, 'Bank Transfer Mark Down', 'PAY_ROLL');
+
+    const data = payrollSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+    // ---- Filter eligible rows: real Bank Transfer Mark Down timestamp ----
+    const eligible = [];
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const empCode = String(psgGetCell_(row, idx, 'Employee Code') || '').trim();
+      if (!empCode) continue;
+
+      const markDown = String(psgGetCell_(row, idx, 'Bank Transfer Mark Down') || '').trim();
+      if (!psgIsRealTimestamp_(markDown)) continue;
+
+      eligible.push({ row, empCode });
+    }
+
+    if (!eligible.length) {
+      return { success: false, message: 'No eligible employees found (no PAY_ROLL row has a Bank Transfer Mark Down timestamp yet).' };
+    }
+
+    // ---- Open or create the Payslip file (copy of the template) ----
+    let existingFileId = psgExtractSpreadsheetId_(psgGetMetaValue_(metaSh, PSG.META_KEYS.PAYSLIP_FILE_ID));
+    let payslipSs;
+    let payslipFile;
+
+    if (existingFileId) {
+      payslipSs = SpreadsheetApp.openById(existingFileId);
+      payslipFile = DriveApp.getFileById(existingFileId);
+    } else {
+      const templateFile = DriveApp.getFileById(PSG.TEMPLATE_FILE_ID);
+      const fileName = `${PSG.FILE_PREFIX}_${monthLabel}`;
+      const folder = DriveApp.getFolderById(PSG.FOLDER_ID);
+
+      payslipFile = templateFile.makeCopy(fileName, folder);
+      payslipSs = SpreadsheetApp.openById(payslipFile.getId());
+
+      existingFileId = payslipFile.getId();
+      createdNewPayslipFile = true;
+      payslipFileForCleanup = payslipFile;
+
+      // GUARDRAIL 1: record the file ID immediately, before any payslip
+      // data is written, so a crash one line later still lets a re-run
+      // find this same file via META_DATA instead of making a duplicate.
+      psgSetMetaHyperlink_(metaSh, PSG.META_KEYS.PAYSLIP_FILE_ID, existingFileId);
+    }
+
+    psgApplyFilePermissions_(payslipFile);
+
+    const empSh = payslipSs.getSheetByName(PSG.TABS.EMPLOYEES);
+    const empHiSh = payslipSs.getSheetByName(PSG.TABS.EMPLOYEES_HINDI);
+    const staffSh = payslipSs.getSheetByName(PSG.TABS.STAFFS);
+    if (!empSh) throw new Error(`Template is missing tab: ${PSG.TABS.EMPLOYEES}`);
+    if (!empHiSh) throw new Error(`Template is missing tab: ${PSG.TABS.EMPLOYEES_HINDI}`);
+    if (!staffSh) throw new Error(`Template is missing tab: ${PSG.TABS.STAFFS}`);
+
+    const logSh = psgGetOrCreateLogSheet_(payslipSs);
+
+    // ---- Append-only: skip employees already generated this month ----
+    const processed = psgReadProcessed_(logSh, monthLabel); // Set of empCode
+
+    // ---- MIGRANT lookup — only needed if there are Worker candidates ----
+    const migrantByCode = psgReadMigrantMap_();
+
+    const newEmployees = [];   // -> Employees tab
+    const newEmployeesHi = []; // -> Employees_Hindi tab
+    const newStaff = [];       // -> Staffs tab
+
+    eligible.forEach((item) => {
+      if (processed.has(item.empCode)) return; // already placed in a tab from an earlier run
+
+      const category = String(psgGetCell_(item.row, idx, 'Category') || '').trim().toUpperCase();
+
+      if (category === PSG.CATEGORY.STAFF) {
+        newStaff.push(item);
+        return;
+      }
+
+      const migrant = String(migrantByCode.get(item.empCode) || '').trim().toUpperCase();
+      if (migrant === PSG.MIGRANT.MIGRANT) {
+        newEmployeesHi.push(item);
+      } else {
+        newEmployees.push(item); // default bucket: NON-MIGRANT / unspecified
+      }
+    });
+
+    if (!newEmployees.length && !newEmployeesHi.length && !newStaff.length) {
+      return { success: true, message: 'No new eligible employees to add — payslips already generated for everyone eligible so far this month.' };
+    }
+
+    // ---- Leave Master lookup — only needed if there are new Staff ----
+    let leaveByCode = new Map();
+    if (newStaff.length) {
+      leaveByCode = psgReadLeaveBalances_();
+    }
+
+    if (newEmployees.length) {
+      const already = psgCountForTab_(logSh, monthLabel, PSG.TABS.EMPLOYEES);
+      psgWriteWorkerTab_(empSh, newEmployees, idx, monthLabel, already);
+      anyDataWrittenThisRun = true;
+      psgAppendToLog_(logSh, monthLabel, newEmployees.map((x) => x.empCode), PSG.TABS.EMPLOYEES);
+    }
+
+    if (newEmployeesHi.length) {
+      const already = psgCountForTab_(logSh, monthLabel, PSG.TABS.EMPLOYEES_HINDI);
+      psgWriteWorkerTab_(empHiSh, newEmployeesHi, idx, monthLabel, already);
+      anyDataWrittenThisRun = true;
+      psgAppendToLog_(logSh, monthLabel, newEmployeesHi.map((x) => x.empCode), PSG.TABS.EMPLOYEES_HINDI);
+    }
+
+    if (newStaff.length) {
+      const already = psgCountForTab_(logSh, monthLabel, PSG.TABS.STAFFS);
+      psgWriteStaffTab_(staffSh, newStaff, idx, monthLabel, leaveByCode, already);
+      anyDataWrittenThisRun = true;
+      psgAppendToLog_(logSh, monthLabel, newStaff.map((x) => x.empCode), PSG.TABS.STAFFS);
+    }
+
+    psgSetMetaValue_(metaSh, PSG.META_KEYS.PAYSLIP_LAST_RUN,
+      Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm'));
+
+    const successMsg =
+      `Payslips generated for ${monthLabel}.\n\n` +
+      `New Employees (Tamil): ${newEmployees.length}\n` +
+      `New Employees (Hindi/Migrant): ${newEmployeesHi.length}\n` +
+      `New Staffs: ${newStaff.length}\n\n` +
+      `File: ${payslipFile.getName()}`;
+
+    return { success: true, message: successMsg };
+
+  } catch (err) {
+    // GUARDRAIL 3: only clean up the file if it was newly created THIS run
+    // AND nothing was actually written to it yet. Never trash a file that
+    // already holds real payslip data, even partially.
+    if (createdNewPayslipFile && !anyDataWrittenThisRun && payslipFileForCleanup) {
+      try { payslipFileForCleanup.setTrashed(true); } catch (_) {}
+    }
+    return { success: false, message: `Error: ${err && err.message ? err.message : err}` };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/* =========================================================
+   WORKER TAB WRITER (shared by Employees + Employees_Hindi —
+   identical cell layout, only the sheet passed in differs)
+========================================================= */
+
+function psgWriteWorkerTab_(sheet, items, idx, monthLabel, processedSoFar) {
+  const L = PSG.WORKER;
+  const startRow = 1 + processedSoFar * L.STRIDE;
+
+  psgEnsureRowCapacity_(sheet, startRow + items.length * L.STRIDE - 1);
+
+  // ---- Step 1: clone the template block's formatting/images/merges for
+  //      every NEW block that doesn't already physically exist yet.
+  //      One copyTo call PER employee block (not one tiling call across
+  //      all of them) — this guarantees each block gets its own real
+  //      clone, rather than relying on copyTo's larger-destination tiling
+  //      behavior, which does not reliably repeat the source pattern when
+  //      called with an explicit CopyPasteType/transposed argument. ----
+  const templateBlock = sheet.getRange(1, 1, L.BLOCK_ROWS, L.IMG_COLS[1]); // A1 through col J, rows 1-29
+  const heightRuns = psgReadRowHeightRuns_(sheet, L.BLOCK_ROWS);
+
+  for (let i = 0; i < items.length; i++) {
+    const blockStart = startRow + i * L.STRIDE;
+    if (blockStart === 1) continue; // employee #1's block already exists (from the template copy)
+    const destBlock = sheet.getRange(blockStart, 1, L.BLOCK_ROWS, L.IMG_COLS[1]);
+    templateBlock.copyTo(destBlock, SpreadsheetApp.CopyPasteType.PASTE_NORMAL, false);
+    psgApplyRowHeightRuns_(sheet, heightRuns, blockStart); // copyTo doesn't carry row heights — do it explicitly
+  }
+
+  // Read the original bilingual banner prefix once (e.g. "PAYSLIP / xx  —  ")
+  // from row 4, so we can rebuild it with the current month.
+  const bannerText = psgBuildMonthBanner_(sheet, monthLabel);
+
+  // Snapshot row 1's block ONCE — this captures every static label exactly
+  // as it exists right now (correct in every case, since row 1 always
+  // either holds the pristine template labels or a previously-written real
+  // employee's block, both of which have correct label text). Each new
+  // employee's block starts as a copy of this snapshot, so only the actual
+  // data cells get overwritten — labels are never blanked.
+  const labelSnapshot = psgSnapshotBlock_(sheet, L.BLOCK_ROWS, L.BULK_COLS[0], L.BULK_COLS[1]);
+
+  // ---- Step 2: BULK pass — columns A:H, every new block, ONE call ----
+  // IMPORTANT: each employee's 29-row block must be followed by one blank
+  // spacer row in this matrix too, so the data lines up with the actual
+  // formatted blocks on the sheet, which are spaced STRIDE (30) rows apart
+  // — not BLOCK_ROWS (29) apart. Without this, employee 2 onward would
+  // land one row earlier than their real formatted block, and the drift
+  // compounds by one extra row for every subsequent employee.
+  const bulkMatrix = [];
+  const bulkColCount = L.BULK_COLS[1] - L.BULK_COLS[0] + 1;
+  items.forEach((item) => {
+    bulkMatrix.push(...psgBuildWorkerBulkBlock_(item.row, idx, bannerText, labelSnapshot));
+    bulkMatrix.push(new Array(bulkColCount).fill('')); // spacer row
+  });
+  sheet.getRange(startRow, L.BULK_COLS[0], bulkMatrix.length, bulkColCount).setValues(bulkMatrix);
+
+  // ---- Step 3: PER-BLOCK pass — column J, rows 11-21 only, one call
+  //      per employee (this column shares space with the logo/signature
+  //      images at other rows, so it must stay inside a safe row window) ----
+  items.forEach((item, i) => {
+    const blockStart = startRow + i * L.STRIDE;
+    const jRowStart = blockStart + (L.PERBLOCK_ROWS[0] - 1);
+    const jRowCount = L.PERBLOCK_ROWS[1] - L.PERBLOCK_ROWS[0] + 1;
+    const jValues = psgBuildWorkerDeductionColumn_(item.row, idx);
+    sheet.getRange(jRowStart, L.PERBLOCK_COL, jRowCount, 1).setValues(jValues);
+  });
+}
+
+// Reads row 4's existing text once and rebuilds "<prefix> —  <MONTH>"
+function psgBuildMonthBanner_(sheet, monthLabel) {
+  const existing = String(sheet.getRange(4, 1).getValue() || '');
+  const dashIdx = existing.indexOf('—');
+  const prefix = dashIdx > -1 ? existing.substring(0, dashIdx).trim() : existing.trim();
+  return `${prefix}  —  ${monthLabel.toUpperCase()}`;
+}
+
+// Snapshots the CURRENT content of columns [colStart..colEnd] for the first
+// `numRows` rows of the tab (i.e. row 1's block, which — whether it still
+// holds the template's pristine sample or a previously-written real
+// employee — always has the correct label text in every non-data cell).
+// Returns a 2D array of plain values (deep, safe to mutate per employee).
+function psgSnapshotBlock_(sheet, numRows, colStart, colEnd) {
+  const colCount = colEnd - colStart + 1;
+  const values = sheet.getRange(1, colStart, numRows, colCount).getValues();
+  return values.map((r) => r.slice());
+}
+
+// Columns A:H (1-8), for ONE block, 29 rows. Row indices below are
+// 0-based offsets into this array (row 1 of the block = index 0).
+// Starts from a clone of the label snapshot (so all static text is
+// preserved automatically) and only overwrites the actual data cells.
+function psgBuildWorkerBulkBlock_(row, idx, bannerText, labelSnapshot) {
+  const g = (h) => psgGetCell_(row, idx, h);
+  const gn = (h) => psgToNumber_(psgGetCell_(row, idx, h));
+
+  const m = labelSnapshot.map((r) => r.slice());
+
+  m[3][0] = bannerText; // A4
+
+  m[5][1] = g('Employee Code');        // B6
+  m[5][7] = psgProperCase_(g('Name')); // H6
+  m[6][1] = psgProperCase_(g('Designation')); // B7
+  m[6][7] = g('Bank Account No');      // H7
+  m[7][1] = g('UAN No');               // B8
+  m[7][7] = g('ESI No');               // H8
+  m[8][1] = psgFormatPaidOn_(g('Bank Transfer Mark Down')); // B9
+  m[8][7] = g('Date Of Joining');      // H9
+
+  const earnRows = [
+    ['Basic', 'Earned Basic'], ['DA', 'Earned DA'], ['HRA', 'Earned HRA'],
+    ['Conveyance Allowance', 'Earned Conveyance Allowance'],
+    ['Special Allowance', 'Earned Special Allowance'],
+    ['Petrol Conveyance', 'Earned Petrol Conveyance'],
+  ];
+  for (let i = 0; i < 6; i++) {
+    const rr = 10 + i; // rows 11-16 -> index 10-15
+    m[rr][2] = gn(earnRows[i][0]); // col C
+    m[rr][3] = gn(earnRows[i][1]); // col D
+  }
+  m[16][3] = gn('Attendance Bonus');  // D17 (no rate for this row, C17 stays blank)
+  m[17][2] = gn('Increment');         // C18
+  m[18][3] = gn('OT Pay');            // D19
+  m[19][3] = gn('Carry Forward Pay'); // D20
+  m[20][3] = gn('Total Earnings');    // D21
+
+  m[22][7] = gn('NET'); // H23
+
+  m[26][0] = g('Total Working Days');  // A27
+  m[26][1] = g('Total Present Days');  // B27
+  m[26][2] = g('LOP Days');            // C27
+  m[26][3] = g('Layoff Days');         // D27
+  m[26][5] = g('Late Penalty');        // F27 — direct value, no conversion
+  m[26][7] = g('OT Hours');            // H27
+
+  return m;
+}
+
+// Column J only, rows 11-21 (11 rows), for ONE block.
+function psgBuildWorkerDeductionColumn_(row, idx) {
+  const gn = (h) => psgToNumber_(psgGetCell_(row, idx, h));
+  return [
+    [gn('Employee PF')],        // J11
+    [gn('Employee ESI')],       // J12
+    [gn('Advance Deduction')],  // J13
+    [gn('LWF')],                // J14
+    [gn('Professional Tax')],   // J15
+    [gn('TDS')],                // J16
+    [gn('Late Deduction')],     // J17 — Late Penalty Amount (rupee)
+    [gn('Other Deductions')],   // J18
+    [''],                       // J19 — unused
+    [''],                       // J20 — unused
+    [gn('Total Deductions')],   // J21
+  ];
+}
+
+/* =========================================================
+   STAFF TAB WRITER
+========================================================= */
+
+function psgWriteStaffTab_(sheet, items, idx, monthLabel, leaveByCode, processedSoFar) {
+  const L = PSG.STAFF;
+  const startRow = 1 + processedSoFar * L.STRIDE;
+
+  psgEnsureRowCapacity_(sheet, startRow + items.length * L.STRIDE - 1);
+
+  const templateBlock = sheet.getRange(1, 1, L.BLOCK_ROWS, L.IMG_COLS[1]);
+  const heightRuns = psgReadRowHeightRuns_(sheet, L.BLOCK_ROWS);
+
+  for (let i = 0; i < items.length; i++) {
+    const blockStart = startRow + i * L.STRIDE;
+    if (blockStart === 1) continue; // employee #1's block already exists (from the template copy)
+    const destBlock = sheet.getRange(blockStart, 1, L.BLOCK_ROWS, L.IMG_COLS[1]);
+    templateBlock.copyTo(destBlock, SpreadsheetApp.CopyPasteType.PASTE_NORMAL, false);
+    psgApplyRowHeightRuns_(sheet, heightRuns, blockStart);
+  }
+
+  const bannerText = psgBuildMonthBanner_(sheet, monthLabel);
+  const labelSnapshot = psgSnapshotBlock_(sheet, L.BLOCK_ROWS, L.BULK_COLS[0], L.BULK_COLS[1]);
+
+  // BULK pass — columns A:G, every new block, ONE call.
+  // Same spacer-row fix as the Worker writer — each 32-row block must be
+  // followed by one blank row in this matrix to match the STRIDE (33)
+  // spacing the formatted blocks actually use on the sheet.
+  const bulkMatrix = [];
+  const bulkColCount = L.BULK_COLS[1] - L.BULK_COLS[0] + 1;
+  items.forEach((item) => {
+    bulkMatrix.push(...psgBuildStaffBulkBlock_(item.row, idx, bannerText, labelSnapshot));
+    bulkMatrix.push(new Array(bulkColCount).fill('')); // spacer row
+  });
+  sheet.getRange(startRow, L.BULK_COLS[0], bulkMatrix.length, bulkColCount).setValues(bulkMatrix);
+
+  // PER-BLOCK pass — columns H:I, rows 6-27 only, one call per employee
+  items.forEach((item, i) => {
+    const blockStart = startRow + i * L.STRIDE;
+    const hiRowStart = blockStart + (L.PERBLOCK_ROWS[0] - 1);
+    const hiRowCount = L.PERBLOCK_ROWS[1] - L.PERBLOCK_ROWS[0] + 1;
+    const hiValues = psgBuildStaffHIColumn_(item.row, idx, leaveByCode, item.empCode);
+    sheet.getRange(hiRowStart, L.PERBLOCK_COLS[0], hiRowCount, 2).setValues(hiValues);
+  });
+}
+
+// Columns A:G (1-7), for ONE block, 32 rows.
+// Starts from a clone of the label snapshot; only data cells are overwritten.
+function psgBuildStaffBulkBlock_(row, idx, bannerText, labelSnapshot) {
+  const g = (h) => psgGetCell_(row, idx, h);
+  const gn = (h) => psgToNumber_(psgGetCell_(row, idx, h));
+
+  const m = labelSnapshot.map((r) => r.slice());
+
+  m[3][0] = bannerText; // A4
+
+  m[5][1] = g('Employee Code'); // B6
+  m[6][1] = psgProperCase_(g('Designation')); // B7
+  m[7][1] = g('UAN No');        // B8
+  m[8][1] = psgFormatPaidOn_(g('Bank Transfer Mark Down')); // B9
+
+  const basic = gn('Basic');
+  const da = gn('DA');
+  const gross = gn('Gross');
+
+  m[10][2] = basic;                              // C11
+  m[10][3] = gn('Earned Basic');                 // D11
+  m[11][2] = da;                                  // C12
+  m[11][3] = gn('Earned DA');                    // D12
+  m[12][2] = gn('HRA');                           // C13
+  m[12][3] = gn('Earned HRA');                   // D13
+  m[13][2] = gn('Conveyance Allowance');          // C14
+  m[13][3] = gn('Earned Conveyance Allowance');  // D14
+  m[14][2] = gn('Special Allowance');             // C15
+  m[14][3] = gn('Earned Special Allowance');     // D15
+  m[15][2] = gn('Petrol Conveyance');             // C16
+  m[15][3] = gn('Earned Petrol Conveyance');     // D16
+  m[16][2] = gn('Increment');                     // C17
+
+  m[18][2] = gross;               // C19
+  m[18][3] = gn('Earned Total');  // D19
+
+  const employerPf = gn('Employer PF');
+  const employerEsi = gn('Employer ESI');
+  const elCost = Math.round(((basic + da) / 26) * 100) / 100;
+  const costToCompany = Math.round((gross + employerPf + employerEsi + elCost) * 100) / 100;
+
+  m[21][2] = employerPf;    // C22
+  m[22][2] = employerEsi;   // C23
+  m[23][2] = elCost;        // C24
+  m[24][2] = costToCompany; // C25
+
+  m[26][6] = gn('NET');     // G27
+
+  m[30][0] = g('Total Working Days'); // A31
+  m[30][1] = g('Total Present Days'); // B31
+  m[30][2] = g('LOP Days');           // C31
+  m[30][3] = g('Layoff Days');        // D31
+  m[30][5] = g('Late Penalty');       // F31 — direct value, no conversion
+
+  return m;
+}
+
+// Columns H:I (2 cols), rows 6-27 (22 rows), for ONE block.
+// Cells not listed below are genuinely blank in the template at that
+// position and are written as '' — none of them hold static text that
+// needs preserving (the only static text in this window, "APPROVED" /
+// "BALANCE" at row 21, is rewritten identically each time, which is
+// harmless).
+function psgBuildStaffHIColumn_(row, idx, leaveByCode, empCode) {
+  const g = (h) => psgGetCell_(row, idx, h);
+  const gn = (h) => psgToNumber_(psgGetCell_(row, idx, h));
+  const leave = leaveByCode.get(empCode) || { el: '', cl: '', sl: '' };
+
+  // 22 rows (template rows 6-27). Index 0 = row 6.
+  const out = [];
+  for (let i = 0; i < 22; i++) out.push(['', '']);
+
+  out[0]  = [psgProperCase_(g('Name')), ''];     // row6:  H6 = Name
+  out[1]  = [g('Date Of Joining'), ''];          // row7:  H7 = DOJ
+  out[2]  = [g('ESI No'), ''];                   // row8:  H8 = ESI No
+  out[3]  = [g('Date Of Joining'), ''];          // row9:  H9 = DOJ (again, per confirmed template)
+  out[5]  = ['', gn('Employee PF')];             // row11: I11 = Employee PF
+  out[6]  = ['', gn('Employee ESI')];            // row12: I12 = Employee ESI
+  out[7]  = ['', gn('TDS')];                     // row13: I13 = TDS
+  out[8]  = ['', gn('Professional Tax')];        // row14: I14 = Professional Tax
+  out[9]  = ['', gn('LWF')];                     // row15: I15 = LWF
+  out[10] = ['', gn('Advance Deduction')];       // row16: I16 = Advance
+  out[11] = ['', gn('Late Deduction')];          // row17: I17 = Late Penalty Amount (rupee)
+  out[12] = ['', gn('Other Deductions')];        // row18: I18 = Other Deductions
+  out[13] = ['', gn('Total Deductions')];        // row19: I19 = Total Deductions
+  out[15] = ['Approved', 'Balance'];             // row21: static sub-headers (harmless re-write)
+  out[16] = [g('Approved EL Days'), leave.el];   // row22: H22/I22
+  out[17] = [g('Approved CL Days'), leave.cl];   // row23: H23/I23
+  out[18] = [g('Approved SL Days'), leave.sl];   // row24: H24/I24
+
+  return out;
+}
+
+/* =========================================================
+   MIGRANT LOOKUP (Employee Master)
+========================================================= */
+
+function psgReadMigrantMap_() {
+  const ss = SpreadsheetApp.openById(CONST.SOURCES.EMPLOYEE_MASTER_SS_ID);
+  const sh = ss.getSheetByName(CONST.TABS.EMPLOYEE_MASTER);
+  if (!sh) throw new Error(`Employee Master tab not found: ${CONST.TABS.EMPLOYEE_MASTER}`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  const map = new Map();
+  if (lastRow < 2) return map;
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = psgBuildHeaderIndex_(headers);
+
+  const cId = idx[psgNorm_('ID.NO')];
+  const cMigrant = idx[psgNorm_('MIGRANT')];
+  if (cId === undefined) throw new Error('Employee Master missing header: ID.NO');
+  if (cMigrant === undefined) throw new Error('Employee Master missing header: MIGRANT');
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+  data.forEach((r) => {
+    const id = String(r[cId] || '').trim();
+    if (!id) return;
+    map.set(id, r[cMigrant]);
+  });
+
+  return map;
+}
+
+/* =========================================================
+   LEAVE MASTER LOOKUP
+========================================================= */
+
+function psgReadLeaveBalances_() {
+  const ss = SpreadsheetApp.openById(CONST.SOURCES.LEAVE_MASTER_SS_ID);
+  const sh = ss.getSheetByName(CONST.TABS.LEAVE_MASTER);
+  if (!sh) throw new Error(`Leave Master tab not found: ${CONST.TABS.LEAVE_MASTER}`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  const map = new Map();
+  if (lastRow < 2) return map;
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = psgBuildHeaderIndex_(headers);
+
+  const cId = idx[psgNorm_('ID.NO')];
+  if (cId === undefined) throw new Error('LEAVE_MASTER missing header: ID.NO');
+
+  const cEl = idx[psgNorm_('EL BALANCE')];
+  const cCl = idx[psgNorm_('CL BALANCE')];
+  const cSl = idx[psgNorm_('SL BALANCE')];
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+  data.forEach((r) => {
+    const id = String(r[cId] || '').trim();
+    if (!id) return;
+    map.set(id, {
+      el: cEl !== undefined ? r[cEl] : '',
+      cl: cCl !== undefined ? r[cCl] : '',
+      sl: cSl !== undefined ? r[cSl] : '',
+    });
+  });
+
+  return map;
+}
+
+/* =========================================================
+   FILE / PERMISSIONS
+========================================================= */
+
+function psgGetOrCreateLogSheet_(ss) {
+  let sh = ss.getSheetByName(PSG.TABS.LOG);
+  if (!sh) {
+    sh = ss.insertSheet(PSG.TABS.LOG);
+    sh.getRange(1, 1, 1, 3).setValues([['Payroll Month', 'Employee Code', 'Tab Name']]);
+    try { sh.hideSheet(); } catch (_) {}
+  }
+  return sh;
+}
+
+function psgApplyFilePermissions_(file) {
+  PSG.ACCESS.EDITORS.forEach((email) => { try { file.addEditor(email); } catch (_) {} });
+  PSG.ACCESS.VIEWERS.forEach((email) => { try { file.addViewer(email); } catch (_) {} });
+}
+
+/* =========================================================
+   APPEND-ONLY LOG
+========================================================= */
+
+function psgReadProcessed_(logSh, monthLabel) {
+  const lastRow = logSh.getLastRow();
+  const set = new Set();
+  if (lastRow < 2) return set;
+
+  const data = logSh.getRange(2, 1, lastRow - 1, 3).getDisplayValues();
+  data.forEach((r) => {
+    if (psgNorm_(r[0]) === psgNorm_(monthLabel)) set.add(String(r[1] || '').trim());
+  });
+
+  return set;
+}
+
+function psgCountForTab_(logSh, monthLabel, tabName) {
+  const lastRow = logSh.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const data = logSh.getRange(2, 1, lastRow - 1, 3).getDisplayValues();
+  let count = 0;
+  data.forEach((r) => {
+    if (psgNorm_(r[0]) === psgNorm_(monthLabel) && psgNorm_(r[2]) === psgNorm_(tabName)) count++;
+  });
+
+  return count;
+}
+
+function psgAppendToLog_(logSh, monthLabel, empCodes, tabName) {
+  if (!empCodes.length) return;
+  const startRow = logSh.getLastRow() + 1;
+  const rows = empCodes.map((c) => [monthLabel, c, tabName]);
+  logSh.getRange(startRow, 1, rows.length, 3).setValues(rows);
+}
+
+/* =========================================================
+   META_DATA HELPERS (on the Locked Payroll file)
+========================================================= */
+
+function psgGetMetaValue_(metaSh, key) {
+  const lastRow = metaSh.getLastRow();
+  if (lastRow < 1) return '';
+  const values = metaSh.getRange(1, 1, lastRow, 2).getDisplayValues();
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || '').trim() === String(key).trim()) return values[i][1];
+  }
+  return '';
+}
+
+function psgSetMetaValue_(metaSh, key, value) {
+  const lastRow = metaSh.getLastRow();
+  const keyText = String(key).trim();
+  if (lastRow >= 1) {
+    const keys = metaSh.getRange(1, 1, lastRow, 1).getDisplayValues();
+    for (let i = 0; i < keys.length; i++) {
+      if (String(keys[i][0] || '').trim() === keyText) {
+        metaSh.getRange(i + 1, 2).setValue(value);
+        return;
+      }
+    }
+  }
+  metaSh.appendRow([keyText, value]);
+}
+
+function psgSetMetaHyperlink_(metaSh, key, spreadsheetId) {
+  const lastRow = metaSh.getLastRow();
+  const keyText = String(key).trim();
+  const formula = `=HYPERLINK("https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit","${spreadsheetId}")`;
+
+  if (lastRow >= 1) {
+    const keys = metaSh.getRange(1, 1, lastRow, 1).getDisplayValues();
+    for (let i = 0; i < keys.length; i++) {
+      if (String(keys[i][0] || '').trim() === keyText) {
+        metaSh.getRange(i + 1, 2).setFormula(formula);
+        return;
+      }
+    }
+  }
+  metaSh.appendRow([keyText, '']);
+  metaSh.getRange(metaSh.getLastRow(), 2).setFormula(formula);
+}
+
+/* =========================================================
+   SMALL HELPERS (psg-prefixed to avoid collisions with
+   existing btf* / glp* local helpers in this project)
+========================================================= */
+
+function psgNorm_(v) {
+  return String(v || '').trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
+function psgBuildHeaderIndex_(headers) {
+  const idx = {};
+  headers.forEach((h, i) => {
+    const k = psgNorm_(h);
+    if (k && idx[k] === undefined) idx[k] = i;
+  });
+  return idx;
+}
+
+function psgRequireHeader_(idx, headerName, sheetName) {
+  const k = psgNorm_(headerName);
+  if (idx[k] === undefined) throw new Error(`Missing required header "${headerName}" in sheet "${sheetName}".`);
+  return idx[k];
+}
+
+function psgGetCell_(row, idx, headerName) {
+  const c = idx[psgNorm_(headerName)];
+  return c === undefined ? '' : row[c];
+}
+
+function psgToNumber_(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  const n = Number(String(v).replace(/[,₹% ]/g, '').trim());
+  return isNaN(n) ? 0 : n;
+}
+
+function psgIsRealTimestamp_(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  if (text === 'SKIPPED - NET 0') return false;
+  if (text === 'SKIPPED - NEGATIVE') return false;
+  return true;
+}
+
+function psgFormatPaidOn_(rawMarkDown) {
+  // Bank Transfer Mark Down is stored as 'yyyy-MM-dd HH:mm'
+  const raw = String(rawMarkDown || '').trim();
+  if (!raw) return '';
+  const d = new Date(raw.replace(' ', 'T'));
+  if (isNaN(d)) return raw;
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd.MM.yyyy');
+}
+
+// PAY_ROLL stores Name / Designation in ALL CAPS. Payslips should show
+// them in Proper Case instead — e.g. "TAHIRA BEE" -> "Tahira Bee",
+// "CUTTING - SKILLED SKIVING" -> "Cutting - Skilled Skiving".
+function psgProperCase_(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  return text
+    .toLowerCase()
+    .replace(/([a-z])([a-z]*)/gi, (match, first, rest) => first.toUpperCase() + rest);
+}
+
+function psgEmptyMatrix_(rows, cols) {
+  const m = [];
+  for (let r = 0; r < rows; r++) m.push(new Array(cols).fill(''));
+  return m;
+}
+
+// Ensures the sheet physically has at least `neededRows` rows before any
+// getRange() call references rows beyond the sheet's current grid size —
+// getRange() does not auto-expand the sheet on its own.
+function psgEnsureRowCapacity_(sheet, neededRows) {
+  const currentMax = sheet.getMaxRows();
+  if (currentMax < neededRows) {
+    sheet.insertRowsAfter(currentMax, neededRows - currentMax);
+  }
+}
+
+// Range.copyTo() copies cell-level formatting (fonts, borders, fills,
+// merges, values) but NOT row height — that's a row-level property, not a
+// cell property. So cloned blocks land in freshly-inserted rows that get
+// Google Sheets' default height, silently losing any custom row heights
+// set in the template (e.g. a thin spacer row, a taller signature row).
+// This reads the template's row heights once per tab, run-length-encodes
+// consecutive equal heights into as few groups as possible, then applies
+// those groups to any destination block in a handful of calls instead of
+// one call per row.
+function psgReadRowHeightRuns_(sheet, blockRows) {
+  const heights = [];
+  for (let r = 1; r <= blockRows; r++) heights.push(sheet.getRowHeight(r));
+
+  const runs = [];
+  let i = 0;
+  while (i < heights.length) {
+    let j = i;
+    while (j + 1 < heights.length && heights[j + 1] === heights[i]) j++;
+    runs.push({ offset: i, count: j - i + 1, height: heights[i] });
+    i = j + 1;
+  }
+  return runs;
+}
+
+function psgApplyRowHeightRuns_(sheet, runs, destBlockStart) {
+  runs.forEach((run) => {
+    sheet.setRowHeights(destBlockStart + run.offset, run.count, run.height);
+  });
+}
+
+function psgExtractSpreadsheetId_(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const match = text.match(/[-\w]{25,}/);
+  return match ? match[0] : '';
+}
